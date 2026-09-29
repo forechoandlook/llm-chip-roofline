@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LLM 芯片配比 · Prefill / Decode</title>
+  <link rel="stylesheet" href="css/app.css" />
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <h1>配比实验室</h1>
+      <p class="sub">改数字立刻重算当前配置。钉住后可对比 Prefill / Decode。</p>
+      <p class="live" id="live">等待输入</p>
+
+      <div class="group">
+        <h2>芯片</h2>
+        <label class="field wide"><span class="k">预设</span><select id="chip-id"></select></label>
+        <label class="field wide"><span class="k">名称（可改）</span><input id="config-name" type="text" placeholder="例如：高带宽方案" autocomplete="off" /></label>
+        <p class="hint" id="chip-notes"></p>
+        <button class="reset" id="reset-chip" type="button">恢复目录值</button>
+        <button class="pin" id="pin-config" type="button">钉住当前配置 · 加入对比</button>
+      </div>
+
+      <div class="group">
+        <h2>配比</h2>
+        <p class="hint">比值和下面的绝对值是同一套数：改比值会重算绝对值，改绝对值会反推比值。</p>
+        <label class="field"><span class="k">Cube BF16 TFLOPS</span><input id="bf16" type="number" step="any" /></label>
+        <label class="field"><span class="k">Cube : Vector (BF16)</span><input id="vec-ratio" type="number" step="any" /></label>
+        <label class="field"><span class="k">带宽 : Cube</span><input id="bw-ratio" type="number" step="any" /></label>
+        <p class="hint">带宽 : Cube = HBM GB/s ÷ Cube BF16 TFLOPS。例如 Cube=1000T、比值=8 → HBM=8000 GB/s。</p>
+        <label class="field"><span class="k">FP8 / BF16</span><input id="fp8-mul" type="number" step="any" /></label>
+        <label class="field"><span class="k">FP4 / BF16</span><input id="fp4-mul" type="number" step="any" /></label>
+      </div>
+      <div class="group">
+        <h2>绝对峰值（由配比算出，可手改）</h2>
+        <label class="field"><span class="k">Vector BF16 TFLOPS</span><input id="vector" type="number" step="any" /></label>
+        <label class="field"><span class="k">HBM 带宽 GB/s</span><input id="bw" type="number" step="any" /></label>
+        <label class="field"><span class="k">FP8 TFLOPS（0=无）</span><input id="fp8" type="number" step="any" /></label>
+        <label class="field"><span class="k">FP4 TFLOPS（0=无）</span><input id="fp4" type="number" step="any" /></label>
+        <label class="field"><span class="k">显存容量 GB</span><input id="cap" type="number" step="any" /></label>
+        <p class="hint">显存容量只判断工作集是否放得下，不参与 T = max(算力,带宽)+0.2 min。</p>
+        <input id="fp32" type="hidden" />
+      </div>
+
+      <div class="group">
+        <h2>负载</h2>
+        <label class="field wide"><span class="k">精度</span>
+          <select id="precision">
+            <option value="nvfp4">NVFP4</option>
+            <option value="mxfp8">MXFP8</option>
+            <option value="w4bf16">W4BF16</option>
+            <option value="bf16">BF16</option>
+          </select>
+        </label>
+        <div class="row-2">
+          <label class="field wide"><span class="k">Prefill batch</span><input id="batch" type="number" min="1" /></label>
+          <label class="field wide"><span class="k">Prefill seq</span><input id="seq" type="number" min="1" /></label>
+        </div>
+        <div class="row-2">
+          <label class="field wide"><span class="k">Decode batch</span><input id="decode-batch" type="number" min="1" /></label>
+          <label class="field wide"><span class="k">Decode context</span><input id="context" type="number" min="1" /></label>
+        </div>
+      </div>
+      <div class="group">
+        <h2>计时假设</h2>
+        <p class="hint">旧模型 Cube∥Vector 完全并行、epilogue 全走 HBM，Cube:Vector 几乎看不出。这里改成不完全并行 + 片上 epilogue。</p>
+        <label class="field"><span class="k">Cube∥Vector γ</span><input id="cube-vec-gamma" type="number" min="0" max="1" step="0.1" /></label>
+        <p class="hint">0=完全并行(max)，1=完全串行。默认 0.4（两套单元会抢流水/依赖）。</p>
+        <label class="field"><span class="k">算力∥带宽 α</span><input id="overlap-alpha" type="number" min="0" max="1" step="0.1" /></label>
+        <label class="field"><span class="k">Epilogue 计 HBM</span><input id="epilogue-hbm" type="number" min="0" max="1" step="0.05" /></label>
+        <p class="hint">RMS / SiLU / 残差按这个比例收 HBM（默认 0.2，当片上为主）。GEMM / FA / 权重仍按全 HBM。</p>
+      </div>
+    </aside>
+
+    <main>
+      <div class="heroes">
+        <article class="hero" id="hero-prefill">
+          <div class="l">Prefill</div>
+          <div class="v" id="kpi-prefill">—</div>
+          <div class="s"><span id="kpi-prefill-tps">—</span> · <span id="kpi-pbound">—</span></div>
+        </article>
+        <article class="hero" id="hero-decode">
+          <div class="l">Decode</div>
+          <div class="v" id="kpi-decode">—</div>
+          <div class="s"><span id="kpi-decode-ms">—</span> · <span id="kpi-dbound">—</span></div>
+        </article>
+      </div>
+      <p class="hint bar-note">Cube:Vector (BF16) <b id="kpi-vec">—</b> · 带宽:Cube <b id="kpi-bw">—</b> · 工作集 <span id="kpi-mem">—</span> · Decode KV <span id="kpi-kv">—</span></p>
+
+      <section class="panel formula-panel method">
+        <h3>性能建模方法</h3>
+        <p class="cap">解析 Roofline，不是 kernel 实测。给定 Qwen3.8-27B 的层结构与 shape，按最少 FLOP / 最少搬运估 Prefill 一次、Decode 一步的下限。芯片只提供 Cube / Vector / HBM 峰值；HBM 容量只做工作集是否装得下，不进时间公式。</p>
+
+        <h4>1. 体积</h4>
+        <ul>
+          <li><b>GEMM</b> Cube = 2MKN。搬运 = 激活 MK + 权重 KN + 写出 MN（按精度位宽）。</li>
+          <li><b>NVFP4 投影</b>：Cube 走 FP4 MMA；激活按 BF16 读；权重 W4 + 每 16 个数一个 FP8 scale；Vector 做激活 scale+cast（2MK）。无原生 FP4 的芯片 Cube 回退 BF16 峰值，权重仍按 4 bit 搬。</li>
+          <li><b>W4BF16</b>：Cube 仍是 BF16 MMA；每颗权重额外 3 FLOP Vector 反量化（3KN，与 token 数 M 无关）。</li>
+          <li><b>MXFP8</b>：Cube 走 FP8；动态激活量化 Vector 2MK。无原生 FP8 则 Cube 回退 BF16。</li>
+          <li><b>FlashAttention</b> 始终 BF16 Cube：4·causal·B·Qh·S·C·D（QKᵀ+PV）。Vector softmax 6·causal·B·Qh·S·C。Qwen3.8-27B head_dim=256，softmax FLOP 大约是 MMA 的 0.6%。</li>
+          <li><b>GDN delta rule</b>：Cube BF16 6·M·Vh·D²，Vector FP32 2·M·Vh·D²（状态衰减，无 FP32 Cube）。FP32 峰值跟 Vector 一起按 Cube:Vector 缩放。</li>
+          <li><b>RMS / SiLU / 残差 / RoPE</b>：纯 Vector。强度大约 3 FLOP/byte，通常先碰到搬运。</li>
+        </ul>
+
+        <h4>2. 单算子时间</h4>
+        <p class="formula-eq">
+          T<sub>Cube</sub> = FLOP<sub>Cube</sub> / Cube峰值<br />
+          T<sub>Vector</sub> = FLOP<sub>Vector</sub> / Vector峰值<br />
+          T<sub>带宽</sub> = Bytes / HBM GB/s<br />
+          T<sub>算力</sub> = max(C, V) + [γ + (1−γ)/n<sub>tiles</sub>] · min(C, V)<br />
+          T = max(T<sub>算力</sub>, T<sub>带宽</sub>) + α · min(T<sub>算力</sub>, T<sub>带宽</sub>)
+        </p>
+        <ul>
+          <li>GEMM tile 约 128×128：同一 tile 上 Vector 等 Cube 写出；tile 之间 Cube∥Vector。稳态 ≈ max(C,V)，头尾气泡 min/nTiles。</li>
+          <li>γ（左侧「Cube∥Vector γ」）是即使很多 tile 也藏不住的串行份额。0 = 完全并行，1 且 tile 少 ≈ C+V。默认 0.4。</li>
+          <li>α 是算力与 HBM 的不完全重叠。默认 0.2。FlashAttention α=0（视为融合、算力与 KV 搬运不同时计双份）。</li>
+          <li>RMS / SiLU / 残差 / RoPE 的 HBM 按「Epilogue 计 HBM」比例计入（默认 0.2，当片上为主）。GEMM、FA、权重仍按全量 HBM。</li>
+        </ul>
+
+        <h4>3. 端到端与墙</h4>
+        <ul>
+          <li>Prefill / Decode 总时间 = 各算子 T 相加（算子之间不重叠）。</li>
+          <li>Decode tok/s = Bd / 一步时间。Prefill tok/s = Bp·seq / Prefill 时间。</li>
+          <li>墙：三条时间里高出另外两条约 15% 的那条（Cube / Vector / 带宽）。流水 T 里还含 γ、α，标签和 T 可能差一档。</li>
+          <li>Prefill 默认四条独立 8K，不是一条 32K：FFN 的 M=Bp·seq，FA 仍按每条序列的 S。</li>
+        </ul>
+
+        <h4>4. 扫配比</h4>
+        <ul>
+          <li>折线和热力图都 <b>固定当前 Cube BF16</b>。拧 Cube:Vector 只改 Vector（以及跟 Vector 走的 FP32）。拧带宽:Cube 只改 HBM = 比值 × Cube TFLOPS。</li>
+          <li>这是「会不会拖 Cube / 会不会拖 Decode」，不是等面积最优。没有功耗、SRAM 驻留、五段 tile 流水（那些在 chip-simulator）。</li>
+        </ul>
+      </section>
+
+      <div class="grid">
+        <section class="panel">
+          <h3>扫 Cube : Vector</h3>
+          <p class="cap">固定当前 Cube BF16 峰值，只改 Vector（FP8/FP4 随 Cube 不变）。每个算子 T<sub>算力</sub>=max(C,V)+γ min，T=max(T<sub>算力</sub>, T<sub>带宽</sub>)+α min，端到端是各算子 T 相加。Prefill 大头是 GEMM：Cube FLOP 远大于 Vector（GEMM 的 Vector 约 1/N），所以 T<sub>算力</sub>≈T<sub>Cube</sub>，Cube 不动则 Prefill ms 几乎不动。Decode 每步重搬权重，T<sub>带宽</sub>≫T<sub>算力</sub>，HBM 也不动，tok/s 几乎不动。线只有在 Vector 砍到 GDN/softmax/SiLU 的 V 盖过 Cube 时才会翘。橙点是当前。</p>
+          <div class="chart" id="chart-sweep-vec"></div>
+        </section>
+        <section class="panel">
+          <h3>扫 带宽 : Cube</h3>
+          <p class="cap">固定 Cube 和 Vector，只改 HBM。Decode 通常随带宽上升；Prefill 在算力墙时这条线会变平。</p>
+          <div class="chart" id="chart-sweep-bw"></div>
+        </section>
+        <section class="panel span-2 method">
+          <h3>Decode 热力图 · Cube:Vector × 带宽:Cube</h3>
+          <div class="how-read">
+            <ul>
+              <li><b>看什么</b>：每个格子是 Decode tok/s（数字越大越好）。颜色偏青快、偏橙红慢。橙框是当前配比（落在最近格子上）。</li>
+              <li><b>横轴</b> 带宽:Cube，往右 HBM 更宽，搬权重更快。</li>
+              <li><b>纵轴</b> Cube:Vector，往上 Vector 更瘦（8:1 → 16:1 → 64:1）。Cube BF16 全程固定。</li>
+              <li><b>悬停</b> 看这一格的墙（带宽 / Vector / Cube）和每步毫秒。</li>
+            </ul>
+            <ul>
+              <li><b>同一列往上</b>：HBM 不变、Vector 变瘦。数字几乎不变 → 还在搬权重；数字掉下去 → Vector 已经盖过搬运。</li>
+              <li><b>同一行往右</b>：Vector 不变、HBM 变宽。数字涨 → 缺带宽；数字不动 → 已经卡在 Vector（或 Cube）。</li>
+              <li><b>怎么决策</b>：橙框所在列整列同色同数字 → 先加 HBM。橙框往上开始变红 → 不要再砍 Vector（W4 是反量化 3KN，NVFP4 是激活 2MK）。</li>
+              <li><b>精度</b>：MXFP8/FP8 多半整张都是带宽墙，横着走才涨。Decode 很少出现 Cube 墙（batch=4 投影强度不够）。</li>
+            </ul>
+          </div>
+          <div class="chart tall" id="chart-decode-heat"></div>
+        </section>
+        <section class="panel span-2">
+          <div class="panel-head">
+            <div>
+              <h3>配置对比 · Prefill / Decode</h3>
+              <p class="cap">无原生 FP4/FP8 Tensor 的芯片在 NVFP4/MXFP8 下不进对比图（否则会按 BF16 回退，和真低精度峰值不可比）。</p>
+            </div>
+            <div class="head-actions">
+              <button class="dl" id="catalog-all" type="button">目录全开</button>
+              <button class="dl" id="catalog-none" type="button">目录全关</button>
+              <button class="dl" id="dl-compare" type="button">下载对比 CSV</button>
+            </div>
+          </div>
+          <div class="table-wrap compare-wrap"><table id="tbl-compare"></table></div>
+          <div class="chart tall" id="chart-compare"></div>
+        </section>
+        <section class="panel">
+          <h3>Prefill 耗时大头</h3>
+          <p class="cap">灰线是按上面公式流水后的总时间（各算子 T 之和）。</p>
+          <div class="chart" id="chart-prefill-walls"></div>
+        </section>
+        <section class="panel">
+          <h3>Decode 耗时大头</h3>
+          <p class="cap">单 step。Attention 读满 context 的 KV cache（16 层）；48 层 GDN 只读写固定 state。</p>
+          <div class="chart" id="chart-decode-walls"></div>
+        </section>
+        <section class="panel">
+          <h3>Prefill 占比</h3>
+          <p class="cap">三条资源各自占用时间（未消重叠）。</p>
+          <div class="chart" id="chart-prefill-share"></div>
+        </section>
+        <section class="panel">
+          <h3>Decode 占比</h3>
+          <p class="cap">三条资源各自占用时间（未消重叠）。</p>
+          <div class="chart" id="chart-decode-share"></div>
+        </section>
+        <section class="panel span-2">
+          <div class="panel-head">
+            <div>
+              <h3>Prefill 算子表</h3>
+              <p class="cap">同名算子按层数合计。流水 ms 即该公式的 T；末行 total 等于 Prefill 总时间。</p>
+            </div>
+            <button class="dl" id="dl-prefill" type="button">下载 CSV</button>
+          </div>
+          <div class="table-wrap"><table id="tbl-prefill"></table></div>
+        </section>
+        <section class="panel span-2">
+          <div class="panel-head">
+            <div>
+              <h3>Decode 算子表</h3>
+              <p class="cap">flash_attn 用 α=0。搬运含 KV cache 整段读取 + 本 step 写入。末行 total 等于每 token 时间。</p>
+            </div>
+            <button class="dl" id="dl-decode" type="button">下载 CSV</button>
+          </div>
+          <div class="table-wrap"><table id="tbl-decode"></table></div>
+        </section>
+      </div>
+    </main>
+  </div>
+  <script src="vendor/echarts.min.js"></script>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
