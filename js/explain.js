@@ -90,7 +90,7 @@ export function renderConfig(ex) {
     ["其中 Attn 投影", `${fmtN(inv.attn)}`],
     ["其中 embed + lm_head", `${fmtN(inv.embed + inv.lmHead)}`],
     ["KV / token（16 层）", `${fmtN(inv.kvElemsPerToken)} elem`],
-    ["当前精度存储", `权重 ${prec.weightBits} bit，激活 ${prec.actBits} bit，KV ${prec.kvBits} bit，GEMM ${prec.gemmDtype}，FA 计算 ${prec.faCompute}`],
+    ["当前精度存储", `FFN：${prec.label}。GDN qkv/z/out：FP8（NVFP4/MXFP8 页）；in_proj_ba + 复发核：BF16/FP32。QKVO + FA + KV：完整 BF16`],
   ];
   return `<table class="doc">
     <tbody>${rows.map(([k, v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join("")}</tbody>
@@ -150,10 +150,7 @@ export function renderShapes(ex) {
 
 function gemmWalk(op, label, M, K, N, prec, chip, peak, gemmDt, alpha) {
   if (!op) return "";
-  const wB = prec.weightBits / 8;
-  const aB = prec.actBits / 8;
   const flop = 2 * M * K * N;
-  const bytes = M * K * aB + K * N * wB + M * N * aB;
   return `<div class="walk">
     <h5>${esc(label)}</h5>
     <pre>GEMM  [${fmtN(M)}, ${fmtN(K)}] × [${fmtN(K)}, ${fmtN(N)}]
@@ -161,15 +158,14 @@ Tensor FLOP = 2·M·K·N
             = 2 · ${fmtN(M)} · ${fmtN(K)} · ${fmtN(N)}
             = ${fmtN(flop)}     （本层实测 ${fmtN(op.flopsTensor)}）
 weight-dequant Vector = ${fmtN(op.flopsVector)}（原生 FP4/FP8 MMA 为 0）
-Bytes = M·K·a + K·N·w + M·N·a
-      a=${prec.actBits}bit (${aB} B)  w=${prec.weightBits}bit (${wB} B)
-      = ${fmtN(bytes)}     （本层实测 ${fmtN(op.bytes)}）
+FP32 epilogue（输出 + s_global）= ${fmtN(op.flopsFp32 || 0)}，与 Cube 按 tile 流水 γ
+Bytes（算子实测，激活按 BF16 读）= ${fmtN(op.bytes)}
 强度 I = FLOP / Bytes = ${fmtN(op.intensity)} FLOP/byte
 计算峰值 = ${gemmDt.toUpperCase()} ${fmtN(peak)} TFLOPS
 T_tensor = FLOP / (peak·1e12) = ${fmtS(op.tTensor)}
 T_vector = ${fmtS(op.tVector)}
 T_bw     = Bytes / (BW·1e9)   = ${fmtS(op.tBw)}
-T_comp   = max(T_tensor, T_vector) = ${fmtS(op.tComp)}
+T_comp   = max(C,V) + γ·min（tile 流水）= ${fmtS(op.tComp)}
 T        = max(T_comp, T_bw) + α·min(...)   α=${alpha}
          = ${fmtS(op.t)}
 瓶颈     = ${boundLabel(op.bound)}</pre>
@@ -189,11 +185,12 @@ function faWalk(op, d, model, phase, prec, alpha) {
 Tensor FLOP = 4 · causal · B · nq · S · C · d
             = 4 · ${causal} · ${B} · ${nq} · ${S} · ${C} · ${hd}
             = ${fmtN(op.flopsTensor)}
-Softmax Vector FLOP = 6 · causal · B · nq · S · C
-                    = ${fmtN(op.flopsVector)}
+FP32 Vector = online softmax（running max、s−m、两次 exp、l 乘加、p/l）
+            + O 按 KV 块缩放 2·B·nq·S·d·⌈C/64⌉
+            + P FP32→BF16 + O 写出
+            = ${fmtN(op.flopsFp32 || op.flopsVector)}
 Bytes（不物化 S×S）= Q + K + V + O + KV写
-  Q,O : B·nq·S·d·2B (BF16)
-  K,V : B·nkv·C·d · kvBytes　nkv=${nkv}, kv=${prec.kvBits}bit
+  Q,O,K,V : BF16，2 字节/elem　nkv=${nkv}
 实测 Bytes = ${fmtN(op.bytes)}
 FA 计算墙走 BF16 Tensor，α_FA=${alpha}
 T_tensor=${fmtS(op.tTensor)}  T_vector=${fmtS(op.tVector)}  T_bw=${fmtS(op.tBw)}
@@ -208,9 +205,8 @@ function gdnWalk(op, d, model, g, phase, workload) {
   return `<div class="walk">
     <h5>GDN delta rule（单层，×48）</h5>
     <pre>state = [B, nV, d, d] = [${B}, ${model.gdn.numVHeads}, ${model.gdn.headDim}, ${model.gdn.headDim}]
-每 token 约 8·nV·d·d FLOP（decay、S·k、外积、Sᵀq）
-FLOP = 8 · ${model.gdn.numVHeads} · ${model.gdn.headDim}² · M
-     = ${fmtN(op.flopsTensor + op.flopsVector)}   记在 ${unit}
+Cube 6·M·Vh·D² + Vector FP32 2·M·Vh·D²（衰减）
+FLOP = ${fmtN(op.flopsTensor + op.flopsVector)}   Cube ${fmtN(op.flopsTensor)} / Vec ${fmtN(op.flopsVector)}
 HBM：${phase === "decode" ? "读+写" : "写回"} state+conv
     = ${fmtN(op.bytes)}　（与上下文长度 C 无关）
 T_tensor=${fmtS(op.tTensor)}  T_vector=${fmtS(op.tVector)}  T_bw=${fmtS(op.tBw)}
@@ -241,14 +237,13 @@ Ridge BF16 = peakFLOP/s / BW = ${r.ridgeBf16.toFixed(1)} FLOP/byte
 ΣT = ${fmtS(result.t)} = ${fmtMs(result.ms)}</pre>
     <h4>精度怎么进公式</h4>
     <pre>${prec.label}
-权重 ${prec.weightBits} bit/elem，激活 ${prec.actBits}，KV ${prec.kvBits}
-投影 GEMM 请求 ${prec.gemmDtype.toUpperCase()}；芯片无该峰值则回退 BF16
-FlashAttention 的 MMA 固定 ${prec.faCompute.toUpperCase()}，softmax 走 Vector
-原生 FP4/FP8 MMA：权重解量化 = 0（scale 在 Tensor Core 内）
-无该峰值回退 BF16 时：按 fallbackDequantPerWeight 计 Vector
-动态激活量化：NVFP4 3·M·K、MXFP8 2·M·K Vector（amax+scale+cast）；搬运仍按 actBits</pre>
+FFN 权重 ${prec.weightBits} bit，GEMM ${prec.gemmDtype.toUpperCase()}（无该峰值则回退 BF16）
+GDN qkv/z/out：FP8；in_proj_ba + 复发核：BF16 / FP32
+QKVO + FA + KV：完整 BF16
+动态量化只发生在走 FP4/FP8 的 FFN（以及 GDN 的 FP8 投影）之前
+Cast 按较宽类型走 FP32 峰值。激活和逐元素算子按 BF16 搬</pre>
     <h4>显存工作集</h4>
-    <pre>权重 = (FFN+GDN+Attn+lm_head)·wBytes + embed·2B(BF16)
+    <pre>权重 = FFN·所选精度 + GDN(qkv/z/out FP8，ba/conv BF16) + Attn BF16 + lm_head + embed·2B
 KV   = 16层 · 4 KV头 · 256 · 2(K,V) · C · B · kvBytes
 GDN  = B · 48层 · (48·128·128 + conv state) · 2B
 当前：权重 ${result.mem.weightGB.toFixed(2)} GB，KV ${result.mem.kvGB.toFixed(2)} GB，
@@ -269,8 +264,8 @@ export function renderWalks(ex) {
   const lmM = workload.lmHeadTokens === "all" ? M : d.B * (result.phase === "prefill" ? 1 : d.S);
   return [
     gemmWalk(gate, `FFN gate_proj（单层，×${model.numLayers}）`, M, H, I, prec, chip, peak, gemmDt, alpha),
-    gemmWalk(qkv, `GDN in_qkv（单层，×${result.inv.nGdn}）`, M, H, g.convDim, prec, chip, peak, gemmDt, alpha),
-    gemmWalk(q, `Attn q_proj（单层，×${result.inv.nAttn}）`, M, H, attnDims(model).qDim, prec, chip, peak, gemmDt, alpha),
+    gemmWalk(qkv, `GDN in_qkv（单层，×${result.inv.nGdn}，FP8）`, M, H, g.convDim, PRECISIONS.mxfp8, chip, peakTflops(chip, gemmComputeFallback(chip, "fp8")), gemmComputeFallback(chip, "fp8"), alpha),
+    gemmWalk(q, `Attn q_proj（单层，×${result.inv.nAttn}，固定 BF16）`, M, H, attnDims(model).qDim, PRECISIONS.bf16, chip, peakTflops(chip, "bf16"), "bf16", alpha),
     faWalk(fa, d, model, result.phase, prec, workload.faOverlapAlpha),
     gdnWalk(gdn, d, model, g, result.phase, workload),
     gemmWalk(lm, `lm_head（M=${lmM}，V=${model.vocabSize}）`, lmM, H, model.vocabSize, prec, chip, peak, gemmDt, alpha),

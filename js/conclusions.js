@@ -42,7 +42,7 @@ export function buildConclusions(model, chip, workload, pair) {
       let s = `Cube:Vector (BF16) = ${r.cubeToVector.toFixed(1)}:1；带宽(GB/s):Cube BF16 = ${r.bwPerMatmul.toFixed(2)}:1。Ridge：BF16 ${r.ridgeBf16.toFixed(1)} FLOP/byte`;
       if (chip.fp8Tflops > 0) s += `，FP8 ${r.ridgeFp8.toFixed(1)}`;
       if (chip.fp4Tflops > 0) s += `，FP4 ${r.ridgeFp4.toFixed(1)}`;
-      else if (workload.precision === "nvfp4") s += "。无原生 FP4 时 NVFP4 投影按 BF16 峰值算、权重仍按 4.5 bit 搬运";
+      else if (workload.precision === "nvfp4") s += "。无原生 FP4 时 FFN 按 BF16 峰值算、权重仍按 4.5 bit 搬运；GDN qkv/z/out 走 FP8，QKVO 是 BF16";
       return s + "。";
     })(),
   });
@@ -50,7 +50,7 @@ export function buildConclusions(model, chip, workload, pair) {
   if (gemmDt !== prec.gemmDtype) {
     lines.push({
       title: "精度回退",
-      body: `这颗芯片没有原生 ${prec.gemmDtype.toUpperCase()} Tensor 峰值，投影 GEMM 回退到 ${gemmDt.toUpperCase()} 算力，只吃到存储位宽下降。Prefill 加速会明显小于 Decode。`,
+      body: `这颗芯片没有原生 ${prec.gemmDtype.toUpperCase()} Tensor 峰值，FFN 回退到 ${gemmDt.toUpperCase()} 算力，只吃到存储位宽下降。GDN qkv/z/out 走 FP8（无 FP8 则回退 BF16）；QKVO 与 FlashAttention 始终是 BF16 Cube。Prefill 加速会明显小于 Decode。`,
     });
   }
 

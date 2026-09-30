@@ -119,6 +119,87 @@ export function drawWallShare(id, result) {
   });
 }
 
+export function drawKeyOpsSweep(id, spec) {
+  const { rows, currentX } = spec;
+  if (!rows.length || rows[0].matmulMs == null) return;
+  let mark = 0;
+  let best = Infinity;
+  rows.forEach((r, i) => {
+    const d = Math.abs(r.x - currentX);
+    if (d < best) {
+      best = d;
+      mark = i;
+    }
+  });
+  setChart(id, {
+    ...baseTheme(),
+    tooltip: {
+      ...baseTheme().tooltip,
+      axisPointer: { type: "cross" },
+      formatter: (items) => {
+        if (!items || !items.length) return "";
+        const r = rows[items[0].dataIndex];
+        if (!r) return "";
+        return `Cube:Vector ${r.x}:1<br/>FFN MatMul+quant ${r.matmulMs.toFixed(1)} ms（${boundLabel(r.matmulBound)}）<br/>FlashAttention ${r.attnMs.toFixed(1)} ms（${boundLabel(r.attnBound)}）<br/>GDN 线性注意力 ${r.gdnMs.toFixed(1)} ms（${boundLabel(r.gdnBound)}）`;
+      },
+    },
+    legend: { ...baseTheme().legend, data: ["FFN MatMul+quant", "FlashAttention", "GDN 线性注意力"] },
+    grid: { left: 56, right: 24, top: 36, bottom: 40 },
+    xAxis: {
+      type: "category",
+      name: "Cube:Vector",
+      data: rows.map((r) => String(r.x)),
+      axisLabel: { color: C.ink },
+      nameTextStyle: { color: C.muted },
+    },
+    yAxis: { type: "value", name: "Prefill ms", axisLabel: { color: C.muted }, splitLine: { lineStyle: { color: C.line } } },
+    series: [
+      {
+        name: "FFN MatMul+quant",
+        type: "line",
+        data: rows.map((r) => +r.matmulMs.toFixed(2)),
+        itemStyle: { color: C.tensor },
+        lineStyle: { width: 2 },
+        markPoint: {
+          data: [{ coord: [String(rows[mark].x), +rows[mark].matmulMs.toFixed(2)], name: "当前" }],
+          symbol: "diamond",
+          symbolSize: 11,
+          itemStyle: { color: C.warn },
+          label: { show: false },
+        },
+      },
+      {
+        name: "FlashAttention",
+        type: "line",
+        data: rows.map((r) => +r.attnMs.toFixed(2)),
+        itemStyle: { color: C.warn },
+        lineStyle: { width: 2 },
+        markPoint: {
+          data: [{ coord: [String(rows[mark].x), +rows[mark].attnMs.toFixed(2)], name: "当前" }],
+          symbol: "diamond",
+          symbolSize: 11,
+          itemStyle: { color: C.warn },
+          label: { show: false },
+        },
+      },
+      {
+        name: "GDN 线性注意力",
+        type: "line",
+        data: rows.map((r) => +r.gdnMs.toFixed(2)),
+        itemStyle: { color: C.vector },
+        lineStyle: { width: 2 },
+        markPoint: {
+          data: [{ coord: [String(rows[mark].x), +rows[mark].gdnMs.toFixed(2)], name: "当前" }],
+          symbol: "diamond",
+          symbolSize: 11,
+          itemStyle: { color: C.warn },
+          label: { color: C.warn, formatter: "当前", fontSize: 10, offset: [14, -8] },
+        },
+      },
+    ],
+  });
+}
+
 export function drawRatioSweep(id, spec) {
   const { xName, rows, currentX } = spec;
   let mark = 0;

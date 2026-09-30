@@ -580,9 +580,14 @@ function render() {
 
   fillCompareTable(current, catalog);
   charts.drawCompare("chart-compare", compare);
+  const vecRows = sweepVecRatio(model, state.chip, state.workload, [2, 4, 6, 8, 12, 16, 24, 32, 48, 64]);
   charts.drawRatioSweep("chart-sweep-vec", {
     xName: "Cube:Vector",
-    rows: sweepVecRatio(model, state.chip, state.workload, [2, 4, 6, 8, 12, 16, 24, 32, 48, 64]),
+    rows: vecRows,
+    currentX: r.cubeToVector,
+  });
+  charts.drawKeyOpsSweep("chart-sweep-ops", {
+    rows: vecRows,
     currentX: r.cubeToVector,
   });
   charts.drawRatioSweep("chart-sweep-bw", {

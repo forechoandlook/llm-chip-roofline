@@ -53,6 +53,7 @@
             <option value="bf16">BF16</option>
           </select>
         </label>
+        <p class="hint">NVFP4 只打 FFN。GDN 的 qkv/z/out 对齐公共配方走 FP8，in_proj_ba 与 QKVO、KV、FA、复发核固定 BF16。</p>
         <div class="row-2">
           <label class="field wide"><span class="k">Prefill batch</span><input id="batch" type="number" min="1" /></label>
           <label class="field wide"><span class="k">Prefill seq</span><input id="seq" type="number" min="1" /></label>
@@ -74,6 +75,128 @@
     </aside>
 
     <main>
+      <section class="panel formula-panel method">
+        <h3>MatMul 怎么算</h3>
+        <p class="cap">页面精度只打 FFN。QKVO + FA + KV 完整 BF16。GDN 的 qkv/z/out 走 FP8，in_proj_ba 与复发核是 BF16/FP32，不走 NVFP4。下表三列只描述 FFN。RMS、SiLU、残差之间激活一直是 BF16。</p>
+        <div class="table-wrap">
+          <table class="doc">
+            <thead>
+              <tr><th>项</th><th>NVFP4</th><th>MXFP8</th><th>W4BF16（W4A16）</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Attn QKVO</td>
+                <td colspan="3">q / k / v / o / gate 投影 + FA + KV：完整 BF16 Cube 与 BF16 搬运，不走本列精度</td>
+              </tr>
+              <tr>
+                <td>GDN</td>
+                <td colspan="3">qkv / z / out：FP8 Cube（即使页面是 NVFP4）。in_proj_ba、conv、复发核：BF16 Cube + FP32 衰减。不走 NVFP4</td>
+              </tr>
+              <tr>
+                <td>FFN Cube</td>
+                <td>2MKN，FP4 峰值</td>
+                <td>2MKN，FP8 峰值</td>
+                <td>2MKN，BF16 峰值</td>
+              </tr>
+              <tr>
+                <td>激活从 HBM 读入</td>
+                <td>BF16，MK×2 字节</td>
+                <td>BF16，MK×2 字节</td>
+                <td>BF16，MK×2 字节。不再量化</td>
+              </tr>
+              <tr>
+                <td>权重量化</td>
+                <td>事先量化。W4 + 每 16 个数 1 字节 E4M3</td>
+                <td>事先量化。W8 + 每 32 个数 1 字节 E8M0</td>
+                <td>事先量化。每颗权重在线反量化</td>
+              </tr>
+              <tr>
+                <td>权重搬运</td>
+                <td>KN×0.5 + KN/16 字节</td>
+                <td>KN×1 + KN/32 字节</td>
+                <td>KN×4.125/8 字节（4 bit + 组 scale）</td>
+              </tr>
+              <tr>
+                <td>动态量化</td>
+                <td>独立算子 *_quant。FP32 Vector。每 16 个数 abs/max/(amax/6)/s_global，每元素再除一次。寄存器内，不另写 HBM</td>
+                <td>独立算子 *_quant。FP32 Vector。每 32 个数 abs/max/E8M0，每元素再除一次。寄存器内</td>
+                <td>无。激活保持 BF16</td>
+              </tr>
+              <tr>
+                <td>s_global</td>
+                <td>一个 FP32 常数（校准值）。不对整段再求张量 amax</td>
+                <td>无</td>
+                <td>无</td>
+              </tr>
+              <tr>
+                <td>块 scale 乘法</td>
+                <td>在 FP4 Tensor Core 内</td>
+                <td>在 FP8 Tensor Core 内</td>
+                <td>无。反量化在 Vector</td>
+              </tr>
+              <tr>
+                <td>Cast（按较宽一侧的峰值）</td>
+                <td>每个输入两次，都按 FP32：BF16→FP32，FP32→E2M1。每个块一次 FP32→E4M3。每个输出一次 FP32→BF16</td>
+                <td>每个输入两次，都按 FP32：BF16→FP32，FP32→FP8。每个块一次 FP32→E8M0。每个输出一次 FP32→BF16</td>
+                <td>权重 INT4→BF16，较宽的是 BF16，含在 3KN 里，走 BF16 Vector 峰值</td>
+              </tr>
+              <tr>
+                <td>Epilogue / 输出</td>
+                <td>留在 MatMul 算子上：FP32 输出 MN、s_global 乘 MN，与 Cube 按 tile 流水（γ）</td>
+                <td>留在 MatMul 算子上：FP32 输出 MN，与 Cube 按 tile 流水。无 s_global</td>
+                <td>无</td>
+              </tr>
+              <tr>
+                <td>写出</td>
+                <td>BF16，MN×2 字节</td>
+                <td>BF16，MN×2 字节</td>
+                <td>BF16，MN×2 字节</td>
+              </tr>
+              <tr>
+                <td>Vector 附加</td>
+                <td>0（量化全部记在 FP32）</td>
+                <td>0</td>
+                <td>3KN，走 BF16 Vector 峰值，与 M 无关</td>
+              </tr>
+              <tr>
+                <td>芯片没有该 Tensor</td>
+                <td>Cube 回退 BF16，权重仍按 4 bit 搬，并加回退反量化</td>
+                <td>Cube 回退 BF16</td>
+                <td>本来就是 BF16 Cube</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="cap">B300，Qwen3.8-27B 的一条 FFN gate（K=5120，N=17408）。FP32 峰值 75T，BF16 Vector 150T，BF16 Cube 2250T。T<sub>V</sub>/T<sub>C</sub> 不随 M 变：量化 FLOP 和 Cube FLOP 都正比于 M。</p>
+        <div class="table-wrap">
+          <table class="doc">
+            <thead>
+              <tr><th></th><th>NVFP4</th><th>MXFP8</th><th>W4BF16</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>FFN gate 的 T<sub>V</sub>/T<sub>C</sub>（epilogue，不含独立 quant）</td>
+                <td>0.053</td>
+                <td>0.012</td>
+                <td>Prefill M=32768：0.001。Decode M=4：3KN 不随 M 缩小</td>
+              </tr>
+              <tr>
+                <td>Prefill（B=4，S=8192）B300</td>
+                <td>约 328 ms，Cube 墙（QKVO 已是 BF16）</td>
+                <td>约 494 ms，Cube 墙</td>
+                <td>约 817 ms，Cube 墙</td>
+              </tr>
+              <tr>
+                <td>Decode（B=4，C=8192）B300</td>
+                <td>约 2.87 ms，带宽墙</td>
+                <td>约 3.95 ms，带宽墙</td>
+                <td>约 2.20 ms，带宽墙</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
       <div class="heroes">
         <article class="hero" id="hero-prefill">
           <div class="l">Prefill</div>
@@ -93,12 +216,9 @@
         <p class="cap">解析 Roofline，不是 kernel 实测。给定 Qwen3.8-27B 的层结构与 shape，按最少 FLOP / 最少搬运估 Prefill 一次、Decode 一步的下限。芯片只提供 Cube / Vector / HBM 峰值；HBM 容量只做工作集是否装得下，不进时间公式。</p>
 
         <h4>1. 体积</h4>
+        <p class="cap">NVFP4 / MXFP8 / W4BF16 的 MatMul 公式在页面最上方的表里。下面是其余算子。</p>
         <ul>
-          <li><b>GEMM</b> Cube = 2MKN。搬运 = 激活 MK + 权重 KN + 写出 MN（按精度位宽）。</li>
-          <li><b>NVFP4 投影</b>：Cube 走 FP4 MMA；激活按 BF16 读；权重 W4 + 每 16 个数一个 FP8 scale；Vector 做激活 scale+cast（2MK）。无原生 FP4 的芯片 Cube 回退 BF16 峰值，权重仍按 4 bit 搬。</li>
-          <li><b>W4BF16</b>：Cube 仍是 BF16 MMA；每颗权重额外 3 FLOP Vector 反量化（3KN，与 token 数 M 无关）。</li>
-          <li><b>MXFP8</b>：Cube 走 FP8；动态激活量化 Vector 2MK。无原生 FP8 则 Cube 回退 BF16。</li>
-          <li><b>FlashAttention</b> 始终 BF16 Cube：4·causal·B·Qh·S·C·D（QKᵀ+PV）。Vector softmax 6·causal·B·Qh·S·C。Qwen3.8-27B head_dim=256，softmax FLOP 大约是 MMA 的 0.6%。</li>
+          <li><b>FlashAttention</b> 始终 BF16 Cube：4·causal·B·Qh·S·C·D（QKᵀ+PV）。online softmax（running max / exp / 归一化）+ O 按块缩放走 FP32 Vector。head_dim=256 时 Cube:Vector FLOP 大约 26:1；B300 上 T<sub>V</sub> 已和 T<sub>C</sub> 同一量级。</li>
           <li><b>GDN delta rule</b>：Cube BF16 6·M·Vh·D²，Vector FP32 2·M·Vh·D²（状态衰减，无 FP32 Cube）。FP32 峰值跟 Vector 一起按 Cube:Vector 缩放。</li>
           <li><b>RMS / SiLU / 残差 / RoPE</b>：纯 Vector。强度大约 3 FLOP/byte，通常先碰到搬运。</li>
         </ul>
@@ -136,13 +256,18 @@
       <div class="grid">
         <section class="panel">
           <h3>扫 Cube : Vector</h3>
-          <p class="cap">固定当前 Cube BF16 峰值，只改 Vector（FP8/FP4 随 Cube 不变）。每个算子 T<sub>算力</sub>=max(C,V)+γ min，T=max(T<sub>算力</sub>, T<sub>带宽</sub>)+α min，端到端是各算子 T 相加。Prefill 大头是 GEMM：Cube FLOP 远大于 Vector（GEMM 的 Vector 约 1/N），所以 T<sub>算力</sub>≈T<sub>Cube</sub>，Cube 不动则 Prefill ms 几乎不动。Decode 每步重搬权重，T<sub>带宽</sub>≫T<sub>算力</sub>，HBM 也不动，tok/s 几乎不动。线只有在 Vector 砍到 GDN/softmax/SiLU 的 V 盖过 Cube 时才会翘。橙点是当前。</p>
+          <p class="cap">固定当前 Cube BF16 峰值，只改 Vector（FP8/FP4 随 Cube 不变，FP32 Vector 跟 Vector 同比缩放）。8:1～16:1 附近 Prefill 仍多半是 GEMM Cube。再往瘦（32:1、64:1）线会翘，因为 GDN 衰减是 FP32 Vector（没有 FP32 Cube），FlashAttention 的 online softmax（动态 max / exp / 归一化）也走 FP32 Vector；这两项时间随 Vector 峰值线性变长，会盖过已经固定的 Cube。</p>
           <div class="chart" id="chart-sweep-vec"></div>
         </section>
         <section class="panel">
           <h3>扫 带宽 : Cube</h3>
           <p class="cap">固定 Cube 和 Vector，只改 HBM。Decode 通常随带宽上升；Prefill 在算力墙时这条线会变平。</p>
           <div class="chart" id="chart-sweep-bw"></div>
+        </section>
+        <section class="panel span-2">
+          <h3>关键算子 · 扫 Cube : Vector</h3>
+          <p class="cap">三条都是 Prefill 全层合计。FFN MatMul 含 gate/up/down 和量化。FlashAttention 是 16 层。GDN 线性注意力是 48 层 delta rule（BF16 Cube + FP32 衰减），不含投影 GEMM。Cube 固定、只拧 Vector：MatMul 几乎水平；Attention 和 GDN 衰减走 FP32 Vector，变瘦后会翘。</p>
+          <div class="chart" id="chart-sweep-ops"></div>
         </section>
         <section class="panel span-2 method">
           <h3>Decode 热力图 · Cube:Vector × 带宽:Cube</h3>
@@ -156,7 +281,7 @@
             <ul>
               <li><b>同一列往上</b>：HBM 不变、Vector 变瘦。数字几乎不变 → 还在搬权重；数字掉下去 → Vector 已经盖过搬运。</li>
               <li><b>同一行往右</b>：Vector 不变、HBM 变宽。数字涨 → 缺带宽；数字不动 → 已经卡在 Vector（或 Cube）。</li>
-              <li><b>怎么决策</b>：橙框所在列整列同色同数字 → 先加 HBM。橙框往上开始变红 → 不要再砍 Vector（W4 是反量化 3KN，NVFP4 是激活 2MK）。</li>
+              <li><b>怎么决策</b>：橙框所在列整列同色同数字 → 先加 HBM。橙框往上开始变红 → 不要再砍 Vector（W4 是反量化 3KN；NVFP4 的 s_global 乘是 MN，Decode 先碰到的是带宽）。</li>
               <li><b>精度</b>：MXFP8/FP8 多半整张都是带宽墙，横着走才涨。Decode 很少出现 Cube 墙（batch=4 投影强度不够）。</li>
             </ul>
           </div>

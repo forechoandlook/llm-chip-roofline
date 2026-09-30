@@ -17,7 +17,7 @@ node serve.mjs
 
 1. 左边选芯片仓库（NVIDIA / 华为 / AMD / 寒武纪 / Intel）或「自定义设计点」。
 2. 所有峰值和配比都可以填。改 `Vector : MatMul = 1 : N` 或 `带宽 GB/s : BF16 TFLOPS` 会回写绝对值。
-3. 精度默认 NVFP4：投影走 FP4 Tensor（芯片 FP4=0 则回退 BF16 算力、仍按 4.5 bit 搬权重），FlashAttention 保持 BF16。
+3. 精度默认 NVFP4：只打 FFN。GDN qkv/z/out 走 FP8，in_proj_ba 与 QKVO / FA / KV 是 BF16。芯片无对应 Tensor 则回退 BF16 算力。
 4. 图和底部表格会说明当前切片的瓶颈；热力图扫配比。
 
 ## 模型

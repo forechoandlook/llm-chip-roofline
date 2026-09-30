@@ -6,16 +6,20 @@ export const PRECISIONS = {
     label: "NVFP4 (W4A4)",
     weightBits: 4.5,
     actBits: 4.5,
-    kvBits: 4.5,
+    kvBits: 16,
     gemmDtype: "fp4",
     faCompute: "bf16",
     dequantFlopsPerWeight: 0,
     fallbackDequantPerWeight: 3,
     /**
-     * Weight GEMM (NVFP4): activations stay BF16 in HBM; global act scale is known.
-     * Vector only applies scale+cast (2 FLOP/elem). Weights W4 + FP8 scale / 16.
+     * 激活动态量化在 CUDA、FP32：
+     *   s_block = (block_amax / 6) / s_global
+     *   x_fp4 = round(x / (s_global * s_block))
+     * 每 16 个输入：16 次 abs、15 次 max、2 次除法；每个输入再 1 次除法。
+     * MatMul 走 FP4 Cube，块 scale 在 Tensor Core。累加输出按 FP32；
+     * 张量级 s_global 在 FP32 Vector 上乘到 MN 个输出。
      */
-    actQuantFlopsPerElem: 2,
+    actQuantFlopsPerElem: 0,
     gemmActBytes: 2,
     gemmOutBytes: 2,
     gemmWeightBits: 4,
@@ -28,12 +32,18 @@ export const PRECISIONS = {
     label: "MXFP8 (W8A8)",
     weightBits: 8.25,
     actBits: 8.25,
-    kvBits: 8,
+    kvBits: 16,
     gemmDtype: "fp8",
     faCompute: "bf16",
     dequantFlopsPerWeight: 0,
     fallbackDequantPerWeight: 1,
-    actQuantFlopsPerElem: 2,
+    actQuantFlopsPerElem: 0,
+    gemmActBytes: 2,
+    gemmOutBytes: 2,
+    gemmWeightBits: 8,
+    weightScaleGroup: 32,
+    weightScaleBytes: 1,
+    actScaleBytes: 0,
   },
   w4bf16: {
     id: "w4bf16",
@@ -63,10 +73,19 @@ const VECTOR_COEFF = {
   mul: 1,
   add: 1,
   sigmoid: 4,
-  softmax: 6,
   rope: 6,
   l2norm: 6,
 };
+
+/** Online softmax 每个 score 的 FP32 Vector：running max、两次减、两次 exp、l 的乘加、最后除。exp 按 8 次 FMA 估。 */
+const FA_SOFTMAX_PER_SCORE =
+  1 + // running max
+  2 + // s − m_new, m_old − m_new
+  2 * 8 + // two exp
+  1 + // l *= exp(Δm)
+  1 + // l += exp(s−m)
+  1; // p /= l
+const FA_KV_BLOCK = 64;
 
 export function defaultWorkload() {
   return {
@@ -130,6 +149,7 @@ function gemm(M, K, N, wBits, aBits, extra = {}) {
     shape: `${M}×${K}×${N}`,
     flopsTensor: flops,
     flopsVector: extra.dequantFlops || 0,
+    flopsFp32: extra.flopsFp32 || 0,
     bytes,
     weightBytes: extra.weightBytes != null ? extra.weightBytes : K * N * bitsToBytes(wBits),
     weightElems: K * N,
@@ -242,18 +262,51 @@ function expandLinear(layer, family, name, M, K, N, prec, chip) {
   const gemmDtype = gemmComputeFallback(chip, prec.gemmDtype);
   const dequant = weightDequantFlops(prec, chip, K, N);
   const aq = actQuantFlops(prec, M, K);
-  if (prec.id === "nvfp4") {
+  if (prec.gemmActBytes) {
     const wPayload = K * N * bitsToBytes(prec.gemmWeightBits);
     const wScale = (K * N / prec.weightScaleGroup) * prec.weightScaleBytes;
     const aScale = prec.actScaleBytes;
     const aIn = M * K * prec.gemmActBytes;
     const aOut = M * N * prec.gemmOutBytes;
     const bytes = aIn + wPayload + wScale + aScale + aOut;
+    const gsz = prec.weightScaleGroup;
+    const blocks = (M * K) / gsz;
+    const amaxOps = gsz === 16 ? 16 + 15 + 2 : gsz + (gsz - 1) + 1;
+    const quantFp32 = blocks * amaxOps + M * K;
+    const castIn = 2 * M * K + blocks;
+    const outFp32 = M * N;
+    const globalScale = prec.actScaleBytes ? M * N : 0;
+    const castOut = M * N;
+    const quantFormula =
+      prec.id === "nvfp4"
+        ? `独立算子。FP32 量化：每 16 个 abs+max+(amax/6)/s_global，每元素再除一次，cast BF16→FP32→E2M1。寄存器内完成，不另写 HBM`
+        : `独立算子。FP32 量化：每 32 个 abs+max+E8M0，每元素再除一次，cast BF16→FP32→FP8。寄存器内完成，不另写 HBM`;
+    const quantOp = makeOp(
+      layer,
+      family,
+      `${name}_quant`,
+      {
+        kind: "vector",
+        flopsTensor: 0,
+        flopsVector: 0,
+        flopsFp32: quantFp32 + castIn,
+        bytes: 0,
+        weightBytes: 0,
+        weightElems: 0,
+        shape: `${M}×${K}`,
+        formula: quantFormula,
+      },
+      { vectorHint: "fp32", unitHint: "fp32" }
+    );
     const formula =
-      `Cube 2MKN · Vec ${aq ? "2MK (BF16×global-scale+cast)" : "0"}${dequant ? "+W dequant" : ""}` +
-      ` · 搬 act BF16 MK + W4 KN + scale KN/16 + out BF16 MN + act-scale 4B`;
+      `Cube 2MKN ${prec.id === "nvfp4" ? "FP4" : "FP8"}（块 scale 在 Tensor Core）· 输出 FP32 MN` +
+      (globalScale ? " · s_global 乘 MN 走 FP32 Vector，与 Cube 按 tile 流水（γ）" : " · 无张量级 s_global") +
+      ` · 写出 FP32→BF16` +
+      `${dequant ? " · W dequant" : ""}` +
+      ` · 搬 act BF16 MK + W payload + block scale + out BF16 MN`;
     const g = gemm(M, K, N, prec.gemmWeightBits, 16, {
       dequantFlops: dequant + aq,
+      flopsFp32: outFp32 + globalScale + castOut,
       bytes,
       weightBytes: wPayload + wScale,
       formula,
@@ -261,14 +314,38 @@ function expandLinear(layer, family, name, M, K, N, prec, chip) {
       scaleBytes: wScale + aScale,
       outBits: 16,
     });
-    return makeOp(layer, family, name, g, { unitHint: gemmDtype });
+    return [quantOp, makeOp(layer, family, name, g, { unitHint: gemmDtype })];
   }
-  const formula = `Cube 2MKN · Vec dequant/quant · 搬 MK·a + KN·w + MN·out`;
+  const formula =
+    prec.id === "bf16"
+      ? `Cube 2MKN BF16 dense：权重、激活、写出全是 BF16，无量化、无 s_global`
+      : `Cube 2MKN · Vec dequant/quant · 搬 MK·a + KN·w + MN·out`;
   const g = gemm(M, K, N, prec.weightBits, prec.actBits, {
     dequantFlops: dequant + aq,
     formula,
   });
-  return makeOp(layer, family, name, g, { unitHint: gemmDtype });
+  return [makeOp(layer, family, name, g, { unitHint: gemmDtype })];
+}
+
+function pushLinear(ops, layer, family, name, M, K, N, prec, chip) {
+  ops.push(...expandLinear(layer, family, name, M, K, N, prec, chip));
+}
+
+/** 注意力投影：NVFP4 / MXFP8 下整段 dense BF16。 */
+function attnProjPrec(prec) {
+  if (prec.id === "nvfp4" || prec.id === "mxfp8") return PRECISIONS.bf16;
+  return prec;
+}
+
+/**
+ * 对齐 SGLang Qwen3.8-NVFP4 / RadixArk：MLP 才是 NVFP4；
+ * GDN 的 qkv/z/out 走 FP8，in_proj_ba（衰减/写入门）留 BF16。
+ * 复发核本身已是 BF16 Cube + FP32 衰减。
+ */
+function gdnProjPrec(name, prec) {
+  if (prec.id !== "nvfp4" && prec.id !== "mxfp8") return prec;
+  if (name === "gdn_in_ba") return PRECISIONS.bf16;
+  return PRECISIONS.mxfp8;
 }
 
 export function phaseBatch(workload) {
@@ -288,8 +365,6 @@ export function expandOps(model, chip, workload) {
   const types = layerTypes(model);
   const gdn = gdnDims(model);
   const att = attnDims(model);
-  const actB = bitsToBytes(prec.actBits);
-  const kvB = bitsToBytes(prec.kvBits);
   const bf16B = 2;
   const ops = [];
 
@@ -318,18 +393,18 @@ export function expandOps(model, chip, workload) {
     );
 
     if (kind === "gdn") {
-      ops.push(expandLinear(li, "gdn_proj", "gdn_in_qkv", M, H, gdn.convDim, prec, chip));
-      ops.push(expandLinear(li, "gdn_proj", "gdn_in_z", M, H, gdn.valueDim, prec, chip));
-      ops.push(expandLinear(li, "gdn_proj", "gdn_in_ba", M, H, gdn.baDim, prec, chip));
+      pushLinear(ops, li, "gdn_proj", "gdn_in_qkv", M, H, gdn.convDim, gdnProjPrec("gdn_in_qkv", prec), chip);
+      pushLinear(ops, li, "gdn_proj", "gdn_in_z", M, H, gdn.valueDim, gdnProjPrec("gdn_in_z", prec), chip);
+      pushLinear(ops, li, "gdn_proj", "gdn_in_ba", M, H, gdn.baDim, gdnProjPrec("gdn_in_ba", prec), chip);
 
       const convFlops = 2 * M * gdn.convDim * model.gdn.convKernel;
       const convBytes =
-        M * gdn.convDim * actB +
-        gdn.convDim * model.gdn.convKernel * bitsToBytes(prec.weightBits) +
-        M * gdn.convDim * actB;
+        M * gdn.convDim * bf16B +
+        gdn.convDim * model.gdn.convKernel * bf16B +
+        M * gdn.convDim * bf16B;
       ops.push(
         makeOp(li, "gdn_conv", "gdn_conv1d", vec(convFlops, convBytes, {
-          weightBytes: gdn.convDim * model.gdn.convKernel * bitsToBytes(prec.weightBits),
+          weightBytes: gdn.convDim * model.gdn.convKernel * bf16B,
           weightElems: gdn.convDim * model.gdn.convKernel,
           shape: `${M}×${gdn.convDim}×${model.gdn.convKernel}`,
         }))
@@ -337,7 +412,7 @@ export function expandOps(model, chip, workload) {
       ops.push(
         makeOp(li, "gdn_conv", "gdn_silu_l2", vec(
           (VECTOR_COEFF.silu + VECTOR_COEFF.l2norm) * M * gdn.convDim,
-          M * gdn.convDim * actB,
+          M * gdn.convDim * bf16B,
           { shape: `${M}×${gdn.convDim}` }
         ))
       );
@@ -372,18 +447,19 @@ export function expandOps(model, chip, workload) {
       const zElems = M * gdn.valueDim;
       ops.push(makeOp(li, "gdn_state", "gdn_out_gate", vec(
         (VECTOR_COEFF.sigmoid + VECTOR_COEFF.mul) * zElems,
-        2 * zElems * actB,
+        2 * zElems * bf16B,
         { shape: `${M}×${gdn.valueDim}` }
       )));
-      ops.push(expandLinear(li, "gdn_proj", "gdn_out", M, gdn.valueDim, H, prec, chip));
+      pushLinear(ops, li, "gdn_proj", "gdn_out", M, gdn.valueDim, H, gdnProjPrec("gdn_out", prec), chip);
     } else {
-      ops.push(expandLinear(li, "attn_proj", "q_proj", M, H, att.qDim, prec, chip));
-      ops.push(expandLinear(li, "attn_proj", "k_proj", M, H, att.kvDim, prec, chip));
-      ops.push(expandLinear(li, "attn_proj", "v_proj", M, H, att.kvDim, prec, chip));
+      const ap = attnProjPrec(prec);
+      pushLinear(ops, li, "attn_proj", "q_proj", M, H, att.qDim, ap, chip);
+      pushLinear(ops, li, "attn_proj", "k_proj", M, H, att.kvDim, ap, chip);
+      pushLinear(ops, li, "attn_proj", "v_proj", M, H, att.kvDim, ap, chip);
       if (model.attn.outputGate === "elementwise") {
-        ops.push(expandLinear(li, "attn_proj", "attn_gate_proj", M, H, att.qDim, prec, chip));
+        pushLinear(ops, li, "attn_proj", "attn_gate_proj", M, H, att.qDim, ap, chip);
       } else {
-        ops.push(expandLinear(li, "attn_proj", "attn_gate_proj", M, H, model.attn.numQHeads, prec, chip));
+        pushLinear(ops, li, "attn_proj", "attn_gate_proj", M, H, model.attn.numQHeads, ap, chip);
       }
 
       if (model.attn.qkNorm) {
@@ -400,59 +476,70 @@ export function expandOps(model, chip, workload) {
       )));
 
       const causal = phase === "prefill" ? 0.5 : 1;
-      const faTensor = 4 * causal * B * model.attn.numQHeads * S * C * model.attn.headDim;
-      const faSoftmax = VECTOR_COEFF.softmax * causal * B * model.attn.numQHeads * S * C;
-      const qBytes = B * model.attn.numQHeads * S * model.attn.headDim * bf16B;
-      const kvReadBytes = B * model.attn.numKVHeads * C * model.attn.headDim * 2 * kvB;
-      const oBytes = B * model.attn.numQHeads * S * model.attn.headDim * bf16B;
-      const kvWriteBytes = B * model.attn.numKVHeads * S * model.attn.headDim * 2 * kvB;
+      const nq = model.attn.numQHeads;
+      const hd = model.attn.headDim;
+      const scores = causal * B * nq * S * C;
+      const oElems = B * nq * S * hd;
+      const faTensor = 4 * causal * B * nq * S * C * hd;
+      // KV 是 BF16；QKᵀ / PV 是 BF16 Cube。online softmax（含动态 max / exp / 归一化）和 O 按块缩放走 FP32 Vector。
+      const nKvBlocks = Math.max(1, Math.ceil(C / FA_KV_BLOCK));
+      const faSoftmax = FA_SOFTMAX_PER_SCORE * scores;
+      const faORescale = 2 * oElems * nKvBlocks;
+      const faScoreCast = scores;
+      const faOutFp32 = oElems + oElems;
+      const qBytes = B * nq * S * hd * bf16B;
+      const kvReadBytes = B * model.attn.numKVHeads * C * hd * 2 * bf16B;
+      const oBytes = B * nq * S * hd * bf16B;
+      const kvWriteBytes = B * model.attn.numKVHeads * S * hd * 2 * bf16B;
       ops.push(
         makeOp(li, "flashattn", "flash_attn", {
           flopsTensor: faTensor,
-          flopsVector: faSoftmax,
+          flopsVector: 0,
+          flopsFp32: faSoftmax + faORescale + faScoreCast + faOutFp32,
           bytes: qBytes + kvReadBytes + oBytes + kvWriteBytes,
           weightBytes: 0,
           weightElems: 0,
           kvReadBytes,
           kvWriteBytes,
-          shape: `B=${B} Qh=${model.attn.numQHeads} KVh=${model.attn.numKVHeads} S=${S} C=${C} D=${model.attn.headDim}`,
-          formula: "Cube 4·causal·B·Qh·S·C·D (QKᵀ+PV, BF16) · Vec 6·causal·B·Qh·S·C softmax FP32 · 搬 Q+KV读+O+KV写",
-          nTiles: Math.max(1, B * model.attn.numQHeads * Math.ceil(S / 64) * Math.ceil(C / 64)),
+          shape: `B=${B} Qh=${nq} KVh=${model.attn.numKVHeads} S=${S} C=${C} D=${hd}`,
+          formula: "Cube 4·causal·B·Qh·S·C·D (QKᵀ+PV, BF16) · KV BF16 · FP32 online softmax（max/sub/exp/sum/div，每 score）· O 按 KV 块缩放 · P FP32→BF16 · O 累加 FP32 再写出 BF16 · 搬 Q+KV读+O+KV写",
+          nTiles: Math.max(1, B * nq * Math.ceil(S / 64) * Math.ceil(C / 64)),
         }, { fused: true, unitHint: "bf16" })
       );
 
       const gateElems = model.attn.outputGate === "elementwise" ? M * att.qDim : M * model.attn.numQHeads;
       ops.push(makeOp(li, "flashattn", "attn_out_gate", vec(
         (VECTOR_COEFF.sigmoid + VECTOR_COEFF.mul) * gateElems,
-        2 * gateElems * actB,
+        2 * gateElems * bf16B,
         { shape: `${M}×${model.attn.outputGate === "elementwise" ? att.qDim : model.attn.numQHeads}` }
       )));
-      ops.push(expandLinear(li, "attn_proj", "o_proj", M, att.qDim, H, prec, chip));
+      pushLinear(ops, li, "attn_proj", "o_proj", M, att.qDim, H, ap, chip);
     }
 
     ops.push(makeOp(li, "residual", "res_mix", vec(VECTOR_COEFF.add * M * H, 3 * M * H * bf16B, { shape: `${M}×${H}` })));
     ops.push(makeOp(li, "norm", "rms_pre_ffn", vec(VECTOR_COEFF.rmsnorm * M * H, 2 * M * H * bf16B, { shape: `${M}×${H}` })));
-    ops.push(expandLinear(li, "ffn", "gate_proj", M, H, I, prec, chip));
-    ops.push(expandLinear(li, "ffn", "up_proj", M, H, I, prec, chip));
+    pushLinear(ops, li, "ffn", "gate_proj", M, H, I, prec, chip);
+    pushLinear(ops, li, "ffn", "up_proj", M, H, I, prec, chip);
     ops.push(makeOp(li, "ffn", "silu_mul", vec(
       (VECTOR_COEFF.silu + VECTOR_COEFF.mul) * M * I,
-      3 * M * I * actB,
+      3 * M * I * bf16B,
       { shape: `${M}×${I}` }
     )));
-    ops.push(expandLinear(li, "ffn", "down_proj", M, I, H, prec, chip));
+    pushLinear(ops, li, "ffn", "down_proj", M, I, H, prec, chip);
     ops.push(makeOp(li, "residual", "res_ffn", vec(VECTOR_COEFF.add * M * H, 3 * M * H * bf16B, { shape: `${M}×${H}` })));
   });
 
   ops.push(makeOp(-2, "norm", "final_rms", vec(VECTOR_COEFF.rmsnorm * M * H, 2 * M * H * bf16B, { shape: `${M}×${H}` })));
 
   const lmM = workload.lmHeadTokens === "all" ? M : B * (phase === "prefill" ? 1 : S);
-  const lm = expandLinear(-2, "lm_head", "lm_head", lmM, H, model.vocabSize, prec, chip);
+  const lmOps = expandLinear(-2, "lm_head", "lm_head", lmM, H, model.vocabSize, prec, chip);
+  const lm = lmOps[lmOps.length - 1];
   if (model.tiedEmbeddings) {
     lm.weightBytes = 0;
     lm.bytes -= model.vocabSize * H * bitsToBytes(prec.weightBits);
     lm.weightElems = 0;
   }
-  ops.push(lm);
+  ops.push(...lmOps);
   return ops;
 }
 
@@ -464,7 +551,8 @@ export function timeOp(op, chip, workload) {
     op.vectorHint === "fp32" || op.unitHint === "fp32"
       ? Math.max(chip.fp32Tflops || chip.vectorTflops, 1e-9)
       : Math.max(chip.vectorTflops, 1e-9);
-  const tVector = op.flopsVector / (vecPeak * 1e12);
+  const fp32Peak = Math.max(chip.fp32Tflops || chip.vectorTflops, 1e-9);
+  const tVector = op.flopsVector / (vecPeak * 1e12) + (op.flopsFp32 || 0) / (fp32Peak * 1e12);
   const hbmFrac = EPILOGUE_OPS.has(op.name) ? (workload.epilogueHbmFrac ?? 1) : 1;
   const tBw = (op.bytes * hbmFrac) / (chip.hbmBandwidthGBs * 1e9);
   const alpha = op.fused ? workload.faOverlapAlpha : workload.overlapAlpha;
@@ -490,7 +578,7 @@ export function timeOp(op, chip, workload) {
     t,
     bound,
     computeDtype,
-    intensity: op.bytes > 0 ? (op.flopsTensor + op.flopsVector) / op.bytes : Infinity,
+    intensity: op.bytes > 0 ? (op.flopsTensor + op.flopsVector + (op.flopsFp32 || 0)) / op.bytes : Infinity,
   };
 }
 
@@ -517,7 +605,7 @@ export function opTable(result) {
     };
     cur.n += 1;
     cur.flopsCube += o.flopsTensor;
-    cur.flopsVector += o.flopsVector;
+    cur.flopsVector += o.flopsVector + (o.flopsFp32 || 0);
     cur.bytes += o.bytes;
     cur.kvReadBytes += o.kvReadBytes || 0;
     cur.kvWriteBytes += o.kvWriteBytes || 0;
@@ -591,8 +679,21 @@ export function memoryFootprint(model, chip, workload) {
   const prec = PRECISIONS[workload.precision];
   const B = phaseBatch(workload);
   const C = workload.phase === "prefill" ? workload.seq : workload.context;
+  const wB = bitsToBytes(prec.weightBits);
+  const attnB = prec.id === "nvfp4" || prec.id === "mxfp8" ? 2 : wB;
+  const g = gdnDims(model);
+  const gdnBa = inv.nGdn * model.hiddenSize * g.baDim;
+  const gdnConvW = inv.nGdn * g.convDim * model.gdn.convKernel;
+  const gdnLin = inv.gdn - gdnBa - gdnConvW;
+  const gdnBytes =
+    prec.id === "nvfp4" || prec.id === "mxfp8"
+      ? gdnLin * bitsToBytes(PRECISIONS.mxfp8.weightBits) + (gdnBa + gdnConvW) * 2
+      : inv.gdn * wB;
   const weightBytes =
-    (inv.ffn + inv.gdn + inv.attn + (model.tiedEmbeddings ? 0 : inv.lmHead)) * bitsToBytes(prec.weightBits) +
+    inv.ffn * wB +
+    gdnBytes +
+    (model.tiedEmbeddings ? 0 : inv.lmHead) * wB +
+    inv.attn * attnB +
     inv.embed * 2;
   const kvBytes = inv.kvElemsPerToken * C * B * bitsToBytes(prec.kvBits);
   const stateBytes = B * (inv.gdnStateElems * 4 + inv.gdnConvStateElems * 2);
@@ -617,7 +718,7 @@ export function simulate(model, chip, workload) {
   const tVector = ops.reduce((s, o) => s + o.tVector, 0);
   const tBw = ops.reduce((s, o) => s + o.tBw, 0);
   const flopsT = ops.reduce((s, o) => s + o.flopsTensor, 0);
-  const flopsV = ops.reduce((s, o) => s + o.flopsVector, 0);
+  const flopsV = ops.reduce((s, o) => s + o.flopsVector + (o.flopsFp32 || 0), 0);
   const bytes = ops.reduce((s, o) => s + o.bytes, 0);
   const byFamily = {};
   for (const o of ops) {
@@ -705,6 +806,39 @@ export function sweepSeq(model, chip, workload, seqs) {
   });
 }
 
+/** Prefill 关键算子：FFN MatMul（含 *_quant）、FlashAttention、GDN 线性注意力（delta rule）。 */
+export function keyOpTimes(result) {
+  const sum = (pred) => {
+    const ops = result.ops.filter(pred);
+    return {
+      t: ops.reduce((s, o) => s + o.t, 0),
+      tCube: ops.reduce((s, o) => s + (o.tCube ?? o.tTensor), 0),
+      tVector: ops.reduce((s, o) => s + o.tVector, 0),
+      tBw: ops.reduce((s, o) => s + o.tBw, 0),
+    };
+  };
+  const matmul = sum((o) => o.family === "ffn" && (o.kind === "gemm" || String(o.name).endsWith("_quant")));
+  const attn = sum((o) => o.name === "flash_attn");
+  const gdn = sum((o) => o.name === "gdn_delta_rule");
+  const bound = (x) => {
+    const slack = 1.15;
+    if (x.tBw > x.tCube * slack && x.tBw > x.tVector * slack) return "bandwidth";
+    if (x.tVector > x.tCube * slack && x.tVector > x.tBw * slack) return "vector";
+    return "tensor";
+  };
+  return {
+    matmulMs: matmul.t * 1e3,
+    matmulBound: bound(matmul),
+    matmul: matmul,
+    attnMs: attn.t * 1e3,
+    attnBound: bound(attn),
+    attn: attn,
+    gdnMs: gdn.t * 1e3,
+    gdnBound: bound(gdn),
+    gdn: gdn,
+  };
+}
+
 export function sweepVecRatio(model, chip, workload, ratios, opts = {}) {
   const cube0 = Math.max(chip.bf16Tflops, 1e-9);
   const vec0 = Math.max(chip.vectorTflops, 1e-9);
@@ -731,6 +865,7 @@ export function sweepVecRatio(model, chip, workload, ratios, opts = {}) {
       fp32Tflops: fp32_0 * (vec / vec0),
     };
     const pair = simulatePair(model, c, workload);
+    const keys = keyOpTimes(pair.prefill);
     return {
       x: cv,
       cube,
@@ -739,6 +874,12 @@ export function sweepVecRatio(model, chip, workload, ratios, opts = {}) {
       decodeTps: pair.decode.tokPerSec,
       prefillBound: pair.prefill.primary,
       decodeBound: pair.decode.primary,
+      matmulMs: keys.matmulMs,
+      matmulBound: keys.matmulBound,
+      attnMs: keys.attnMs,
+      attnBound: keys.attnBound,
+      gdnMs: keys.gdnMs,
+      gdnBound: keys.gdnBound,
     };
   });
 }

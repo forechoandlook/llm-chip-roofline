@@ -13,6 +13,7 @@ import {
   sweepVecRatio,
   sweepBwRatio,
   sweepHeatmap,
+  keyOpTimes,
 } from "../js/engine.js";
 import { chipById, chipRatios } from "../js/chips.js";
 import { buildExplain, renderExplainHtml } from "../js/explain.js";
@@ -151,19 +152,60 @@ function close(a, b, rel, msg) {
   const chip = chipById("b300-sxm");
   const r = simulate(model, chip, { ...defaultWorkload(), phase: "prefill", precision: "nvfp4" });
   const q = r.ops.find((o) => o.name === "gate_proj");
+  const qq = r.ops.find((o) => o.name === "gate_proj_quant");
   assert(q.computeDtype === "fp4", "B300 NVFP4 GEMM uses fp4 peak");
-  close(q.flopsVector, 2 * q.M * q.K, 0, "NVFP4 weight GEMM: Vec 2MK (global scale already known)");
+  close(q.flopsVector, 0, 0, "NVFP4 GEMM has no BF16 vector");
+  assert(qq, "quant is a separate op");
+  const blocks = (q.M * q.K) / 16;
+  close(
+    qq.flopsFp32,
+    blocks * (16 + 15 + 2) + q.M * q.K + 2 * q.M * q.K + blocks,
+    0,
+    "quant op: amax + per-elem div + input casts"
+  );
+  close(qq.bytes, 0, 0, "quant is register-only, no extra HBM");
+  close(
+    q.flopsFp32,
+    q.M * q.N + q.M * q.N + q.M * q.N,
+    0,
+    "GEMM epilogue: FP32 out + s_global + FP32→BF16, pipelines with Cube"
+  );
+  assert(q.tVector > 0 && q.tComp < q.tTensor + q.tVector, "s_global Vector pipelines with Cube");
   const wPayload = q.K * q.N * 0.5;
   const wScale = (q.K * q.N / 16) * 1;
   const expectB = q.M * q.K * 2 + wPayload + wScale + 4 + q.M * q.N * 2;
   close(q.bytes, expectB, 0, "NVFP4 GEMM bytes: BF16 act + W4 + scale/16 + BF16 out");
-  assert(q.formula.includes("W4"), `formula explains traffic, got ${q.formula}`);
+  assert(q.formula.includes("scale"), `formula explains traffic, got ${q.formula}`);
   const fa = r.ops.find((o) => o.name === "flash_attn");
   assert(fa.computeDtype === "bf16", "FA stays bf16");
+  for (const name of ["q_proj", "k_proj", "v_proj", "o_proj", "attn_gate_proj"]) {
+    const op = r.ops.find((o) => o.name === name);
+    assert(op && op.computeDtype === "bf16", `${name} is dense BF16 Cube`);
+    close(op.flopsFp32, 0, 0, `${name} has no FP32 quant/epilogue`);
+    close(op.flopsVector, 0, 0, `${name} has no dequant vector`);
+    assert(!r.ops.some((o) => o.name === `${name}_quant`), `${name} has no quant op`);
+    close(op.bytes, op.M * op.K * 2 + op.K * op.N * 2 + op.M * op.N * 2, 0, `${name} BF16 MK+KN+MN`);
+  }
+  {
+    const r8 = simulate(model, chip, { ...defaultWorkload(), phase: "prefill", precision: "mxfp8" });
+    const q8 = r8.ops.find((o) => o.name === "q_proj");
+    assert(q8.computeDtype === "bf16", "MXFP8 still uses BF16 QKVO");
+    assert(!r8.ops.some((o) => o.name === "q_proj_quant"), "MXFP8 QKVO has no FP8 quant");
+    const g8 = r8.ops.find((o) => o.name === "gate_proj");
+    assert(g8.computeDtype === "fp8", "FFN stays FP8 under MXFP8");
+    assert(r8.ops.find((o) => o.name === "gdn_in_qkv").computeDtype === "fp8", "MXFP8 GDN qkv is FP8");
+    assert(r8.ops.find((o) => o.name === "gdn_in_ba").computeDtype === "bf16", "MXFP8 GDN ba stays BF16");
+  }
   const gdn = r.ops.find((o) => o.name === "gdn_delta_rule");
   assert(gdn.unitHint === "bf16", "GDN matmul path is BF16 Cube");
   assert(gdn.vectorHint === "fp32", "GDN decay is FP32 Vector");
   assert(gdn.tCube > 0 && gdn.tVector > 0, "both Cube and Vector times");
+  const gqkv = r.ops.find((o) => o.name === "gdn_in_qkv");
+  const gba = r.ops.find((o) => o.name === "gdn_in_ba");
+  assert(gqkv.computeDtype === "fp8", "GDN qkv/z/out follow FP8 projections (SGLang/RadixArk)");
+  assert(r.ops.some((o) => o.name === "gdn_in_qkv_quant"), "GDN qkv has FP8 quant");
+  assert(gba.computeDtype === "bf16", "GDN in_proj_ba stays BF16");
+  assert(!r.ops.some((o) => o.name === "gdn_in_ba_quant"), "GDN ba has no quant");
 }
 
 {
@@ -315,6 +357,11 @@ function close(a, b, rel, msg) {
   close(tot.flopsCube, r.flopsT, 1e-9, "total cube FLOPs");
   close(tot.flopsVector, r.flopsV, 1e-9, "total vector FLOPs");
   close(tot.bytes, r.bytes, 1e-9, "total bytes");
+  {
+    const k = keyOpTimes(r);
+    assert(k.matmulMs > 0 && k.attnMs > 0 && k.gdnMs > 0, "key ops have time");
+    assert(k.matmulMs < r.ms && k.attnMs < r.ms && k.gdnMs < r.ms, "key ops are a fraction of prefill");
+  }
   assert(tot.n === r.ops.length, `total layers/ops ${tot.n} vs ${r.ops.length}`);
 }
 
@@ -327,6 +374,10 @@ function close(a, b, rel, msg) {
   close(vec[1].cube, chip.bf16Tflops, 1e-6, "fixed Cube at 2:1");
   const rel = Math.abs(vec[1].prefillMs - vec[0].prefillMs) / vec[0].prefillMs;
   assert(rel < 0.05, `fixed Cube: Prefill barely moves with Vector (${rel})`);
+  assert(vec[0].matmulMs > 0 && vec[0].attnMs > 0 && vec[0].gdnMs > 0, "sweep reports key-op times");
+  const mRel = Math.abs(vec[1].matmulMs - vec[0].matmulMs) / vec[0].matmulMs;
+  assert(mRel < 0.08, `FFN MatMul+quant barely moves with Vector (${mRel})`);
+  assert(vec[0].matmulBound === "tensor", `MatMul stays Cube-bound, got ${vec[0].matmulBound}`);
   const iso = sweepVecRatio(model, chip, wl, [8, 2], { isoBudget: true });
   assert(iso[1].prefillMs > iso[0].prefillMs, "iso-budget opt-in: more Vector share (less Cube) slows prefill");
   const bw = sweepBwRatio(model, chip, wl, [2, 8]);
